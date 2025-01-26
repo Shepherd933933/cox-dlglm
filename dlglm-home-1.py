@@ -1311,18 +1311,24 @@ def dlglm(X,Rx,Y,Ry, covars_r_x, covars_r_y, norm_means_x, norm_sds_x, norm_mean
         }
     
 
-    # LEVEL 1 
+    
+
+    # LEVEL 1
     def impute(iota_xfull, iota_yfull, iota_x, iota_y, mask_x, mask_y, covar_miss, niws_z, temp):
-        # LEVEL 2
-        # Initialize batch variables
+        # LEVEL 2: Initialize batch variables
         batch_size = iota_x.shape[0]
         tiled_iota_x = torch.Tensor.repeat(iota_x,[niws_z,1]).cuda()
         tiled_iota_y = torch.Tensor.repeat(iota_y,[niws_z,1]).cuda()
         tiled_mask_x = torch.Tensor.repeat(mask_x,[niws_z,1]).cuda()
         tiled_mask_y = torch.Tensor.repeat(mask_y,[niws_z,1]).cuda()
 
-        # LEVEL 2
-        # Handle optional full data tiling
+        # LEVEL 2: Add Cox-specific validation
+        if family == "Cox":
+            # Validate time and event data
+            assert torch.all(iota_y[:,0] >= 0), "Survival times must be non-negative"
+            assert torch.all((iota_y[:,1] == 0) | (iota_y[:,1] == 1)), "Event indicators must be binary"
+
+        # LEVEL 2: Handle optional full data tiling
         if not draw_miss:
             tiled_iota_xfull = torch.Tensor.repeat(iota_xfull,[niws_z,1]).cuda()
             tiled_iota_yfull = torch.Tensor.repeat(iota_yfull,[niws_z,1]).cuda()
@@ -1330,24 +1336,31 @@ def dlglm(X,Rx,Y,Ry, covars_r_x, covars_r_y, norm_means_x, norm_sds_x, norm_mean
             tiled_iota_xfull = None
             tiled_iota_yfull = None
 
-        # LEVEL 2  
-        # Handle covariates
+        # LEVEL 2: Handle covariates
         if covars:
             tiled_covars_miss = torch.Tensor.repeat(covar_miss,[M,1])
         else:
             tiled_covars_miss = None
 
-        # LEVEL 2
-        # Forward pass
-        xincluded, iota_y, p_xs, qzgivenx, qxmgivenxors, qymgivenyor, pygivenx, prgivenxy, params_xm, params_ym, params_x, params_y, params_r, params_z, zgivenx = forward(iota_xfull, iota_yfull, iota_x, iota_y, mask_x, mask_y, batch_size, niws_z, temp)
-
-        # LEVEL 2
-        # Handle multinomial case
+        # LEVEL 2: Forward pass
+        #     xincluded, iota_y, p_xs, qzgivenx, qxmgivenxors, qymgivenyor, pygivenx, prgivenxy, params_xm, params_ym, params_x, params_y, params_r, params_z, zgivenx = forward(iota_xfull, iota_yfull, iota_x, iota_y, mask_x, mask_y, batch_size, niws_z, temp)
+        xincluded, iota_y, p_xs, qzgivenx, qxmgivenxors, qymgivenyor, pygivenx, prgivenxy, params_xm, params_ym, params_x, params_y, params_r, params_z, zgivenx = forward(
+            iota_xfull=tiled_iota_xfull,
+            iota_yfull=tiled_iota_yfull,
+            iota_x=tiled_iota_x,
+            iota_y=tiled_iota_y,
+            mask_x=tiled_mask_x,
+            mask_y=tiled_mask_y,
+            batch_size=batch_size,
+            niw=niws_z,
+            temp=temp
+        )
+    
+        # LEVEL 2: Handle multinomial case
         if family=="Multinomial":
-            iota_y=torch.nn.functional.one_hot(iota_y.to(torch.int64),num_classes=C).reshape([-1,C])
-
-        # LEVEL 2
-        # Initialize log probability accumulators 
+            yincluded=torch.nn.functional.one_hot(yincluded.to(torch.int64),num_classes=C).reshape([-1,C])
+        
+        # LEVEL 2: Initialize probability accumulators
         logpx_real = torch.Tensor([0]).cuda()
         logpx_cat = torch.Tensor([0]).cuda()
         logpx_count = torch.Tensor([0]).cuda()
@@ -1356,69 +1369,43 @@ def dlglm(X,Rx,Y,Ry, covars_r_x, covars_r_y, norm_means_x, norm_sds_x, norm_mean
         logqxmgivenxor_cat = torch.Tensor([0]).cuda()
         logqxmgivenxor_count = torch.Tensor([0]).cuda()
         logqxmgivenxor_pos = torch.Tensor([0]).cuda()
-
-        # LEVEL 2
-        # Compute log probabilities - Case 1: Both X and Y missing
-        if miss_x and miss_y:
-            # LEVEL 3
-            # Handle missingness model
+        
+        # LEVEL 2: Compute log probabilities for different cases
+        if miss_x and miss_y:     # case 3
+            # LEVEL 3: Handle missingness model
             if not Ignorable:
                 all_logprgivenxy = prgivenxy.log_prob(torch.cat([tiled_mask_x[:,miss_ids], tiled_mask_y],1))
                 logprgivenxy = torch.sum(all_logprgivenxy,1).reshape([niws_z*M*M,batch_size])
             else:
-                all_logprgivenxy=torch.Tensor([0]).cuda()
-                logprgivenxy=torch.Tensor([0]).cuda()
+                all_logprgivenxy = torch.Tensor([0]).cuda()
+                logprgivenxy = torch.Tensor([0]).cuda()
 
-        # LEVEL 2
-        # Compute log probabilities - Case 1: Both X and Y missing
-        if miss_x and miss_y:
-            # LEVEL 3
-            # Handle missingness model
-            if not Ignorable:
-                all_logprgivenxy = prgivenxy.log_prob(torch.cat([tiled_mask_x[:,miss_ids], tiled_mask_y],1))
-                logprgivenxy = torch.sum(all_logprgivenxy,1).reshape([niws_z*M*M,batch_size])
-            else:
-                all_logprgivenxy=torch.Tensor([0]).cuda()
-                logprgivenxy=torch.Tensor([0]).cuda()
-
-            # LEVEL 3
-            # Compute log probability for y|x
+            # LEVEL 3: Handle log probability computation for y|x
             if family == "Cox":
-                # LEVEL 4
-                # Handle Cox-specific computations
                 times = iota_y[:,0]
                 events = iota_y[:,1]
                 risk_scores = pygivenx.loc
                 
-                # LEVEL 4
-                # Compute Cox model metrics
                 baseline_hazard, unique_times = cox_baseline_hazard(risk_scores, times, events)
                 cox_pl_loss = cox_loss(risk_scores, times, events)
                 all_log_pygivenx = -cox_pl_loss
-            elif family=="Gaussian":
-                all_log_pygivenx = pygivenx.log_prob(iota_y.reshape([-1]))
             else:
-                all_log_pygivenx = pygivenx.log_prob(iota_y)
+                if family=="Gaussian":
+                    all_log_pygivenx = pygivenx.log_prob(yincluded.reshape([-1]))
+                else:
+                    all_log_pygivenx = pygivenx.log_prob(yincluded)
 
-            # LEVEL 3
-            # Reshape log probability
             logpygivenx = all_log_pygivenx.reshape([niws_z*M*M,batch_size])
 
-            # LEVEL 3
-            # Compute log probabilities for feature types
+            # LEVEL 3: VAE log p(x) computations
             if exists_types[0]:
                 logpx_real = torch.sum(p_xs['real'].log_prob(xincluded[:,ids_real]),axis=1).reshape([niws_z*M*M,batch_size])
             if exists_types[1]:
                 logpx_count = torch.sum(p_xs['count'].log_prob(xincluded[:,ids_count]),axis=1).reshape([niws_z*M*M,batch_size])
             if exists_types[2]:
                 logpx_pos = torch.sum(p_xs['pos'].log_prob(xincluded[:,ids_pos]),axis=1).reshape([niws_z*M*M,batch_size])
-
-            # LEVEL 3
-            # Handle categorical features
             if exists_types[3]:
                 for ii in range(0,p_cat):
-                    # LEVEL 4
-                    # Calculate indices for categorical data
                     if ii==0:
                         C0=0
                         C1=int(Cs[ii])
@@ -1426,29 +1413,20 @@ def dlglm(X,Rx,Y,Ry, covars_r_x, covars_r_y, norm_means_x, norm_sds_x, norm_mean
                         C0=C1
                         C1=C0 + int(Cs[ii])
                     
-                    # LEVEL 4
-                    # Compute log probabilities for categorical features
                     if ii==0:
                         logpx_cat = torch.sum(p_xs['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([-1, int(Cs[ii])])),axis=1).reshape([-1,batch_size])
                     else:
                         logpx_cat = logpx_cat + torch.sum(p_xs['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([-1, int(Cs[ii])])),axis=1).reshape([-1,batch_size])
 
-            # LEVEL 3
-            # Compute log q(x|.) for each feature type
+            # LEVEL 3: Log q(xm|xo,r) computations
             if exists_types[0]:
                 logqxmgivenxor_real = torch.sum(qxmgivenxors['real'].log_prob(xincluded[:,ids_real].reshape([-1,p_real]))*(1-tiled_mask_x[:,ids_real]),1).reshape([-1,batch_size])
             if exists_types[1]:
                 logqxmgivenxor_count = torch.sum(qxmgivenxors['count'].log_prob(xincluded[:,ids_count].reshape([-1,p_count]))*(1-tiled_mask_x[:,ids_count]),1).reshape([niws_z*M*M,batch_size])
             if exists_types[2]:
                 logqxmgivenxor_pos = torch.sum(qxmgivenxors['pos'].log_prob(xincluded[:,ids_pos].reshape([-1,p_pos]))*(1-tiled_mask_x[:,ids_pos]),1).reshape([-1,batch_size])
-
-
-            # LEVEL 3
-            # Handle categorical features q distributions
             if exists_types[3]:
                 for ii in range(0,p_cat):
-                    # LEVEL 4
-                    # Calculate indices for categorical data
                     if ii==0:
                         C0=0
                         C1=int(Cs[ii])
@@ -1456,269 +1434,164 @@ def dlglm(X,Rx,Y,Ry, covars_r_x, covars_r_y, norm_means_x, norm_sds_x, norm_mean
                         C0=C1
                         C1=C0 + int(Cs[ii])
                     
-                    # LEVEL 4
-                    # Compute log q probabilities for categorical features
                     if ii==0:
-                        logqxmgivenxor_cat = (qxmgivenxors['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([-1, int(Cs[ii])]))*(1-tiled_mask_x[:,(p_real + p_count + p_pos + C0)])).reshape([-1,batch_size])
+                        logqxmgivenxor_cat = (qxmgivenxors['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([-1, int(Cs[ii])]))*(1-tiled_mask_x[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)])).reshape([-1,batch_size])
                     else:
-                        logqxmgivenxor_cat = logqxmgivenxor_cat + (qxmgivenxors['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([-1, int(Cs[ii])]))*(1-tiled_mask_x[:,(p_real + p_count + p_pos + C0)])).reshape([-1,batch_size])
+                        logqxmgivenxor_cat = logqxmgivenxor_cat + (qxmgivenxors['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([-1, int(Cs[ii])]))*(1-tiled_mask_x[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)])).reshape([-1,batch_size])
 
-            # LEVEL 3
-            # Initialize probability sums
+            # LEVEL 3: Initialize sum terms
             logpxsum = torch.zeros([M*M,batch_size]).cuda()
             logqxsum = torch.zeros([niws_z*M*M,batch_size]).cuda()
             
-            # LEVEL 3
-            # Compute log q(ym|yo,r,xm,xo)
-            if family == "Cox":
-                # LEVEL 4
-                # Handle Cox model specific y imputation
-                logqymgivenyor = (qymgivenyor.log_prob(torch.cat([iota_y[:,0].reshape(-1,1), 
-                                iota_y[:,1].reshape(-1,1)], dim=1))*(1-tiled_mask_y)).reshape([niws_z*M*M,batch_size])
-            else:
-                logqymgivenyor = (qymgivenyor.log_prob(iota_y)*(1-tiled_mask_y)).reshape([niws_z*M*M,batch_size])
+            # LEVEL 3: Log q(ym|yo,r,xm,xo)
+            logqymgivenyor = (qymgivenyor.log_prob(yincluded)*(1-tiled_mask_y)).reshape([niws_z*M*M,batch_size])
 
-        # LEVEL 2
-        # Case 2: Only X missing
-        elif miss_x and not miss_y:
-            # LEVEL 3
-            # Handle missingness model
-            if not Ignorable:
-                all_logprgivenxy = prgivenxy.log_prob(tiled_mask_x[:,miss_ids])
-                logprgivenxy = torch.sum(all_logprgivenxy,1).reshape([niws_z*M,batch_size])
-            else:
-                all_logprgivenxy=torch.Tensor([0]).cuda()
-                logprgivenxy=torch.Tensor([0]).cuda()
-
-            # LEVEL 3
-            # Compute log probability for y|x
-            if family == "Cox":
-                # LEVEL 4 
-                # Handle Cox model computations
-                times = iota_y[:,0]
-                events = iota_y[:,1]
-                risk_scores = pygivenx.loc
-                
-                # LEVEL 4
-                # Compute Cox metrics
-                baseline_hazard, unique_times = cox_baseline_hazard(risk_scores, times, events)
-                cox_pl_loss = cox_loss(risk_scores, times, events)
-                all_log_pygivenx = -cox_pl_loss
-            elif family=="Multinomial":
-                all_log_pygivenx = pygivenx.log_prob(iota_y)
-            else:
-                all_log_pygivenx = pygivenx.log_prob(iota_y.reshape([-1]))
-
-            # LEVEL 3
-            # Reshape log probability
-            logpygivenx = all_log_pygivenx.reshape([niws_z*M,batch_size])
-
-            # LEVEL 3
-            # Compute log probabilities for feature types
-            if exists_types[0]:
-                logpx_real = torch.sum(p_xs['real'].log_prob(xincluded[:,ids_real]),axis=1).reshape([niws_z*M,batch_size])
-            if exists_types[1]:
-                logpx_count = torch.sum(p_xs['count'].log_prob(xincluded[:,ids_count]),axis=1).reshape([niws_z*M,batch_size])
-            if exists_types[2]:
-                logpx_pos = torch.sum(p_xs['pos'].log_prob(xincluded[:,ids_pos]),axis=1).reshape([niws_z*M,batch_size])
-
-            # LEVEL 3
-            # Handle categorical features
-            if exists_types[3]:
-                for ii in range(0,p_cat):
-                    # LEVEL 4
-                    # Calculate indices for categorical data
-                    if ii==0:
-                        C0=0
-                        C1=int(Cs[ii])
-                    else:
-                        C0=C1
-                        C1=C0 + int(Cs[ii])
-                        
-                    # LEVEL 4
-                    # Compute log probabilities
-                    if ii==0:
-                        logpx_cat = p_xs['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)]).reshape([niws_z*M,batch_size])
-                    else:
-                        logpx_cat = logpx_cat + p_xs['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)]).reshape([niws_z*M,batch_size])
-
-            # LEVEL 3
-            # Compute log q(x|.) for each feature type 
-            if exists_types[0]:
-                logqxmgivenxor_real = torch.sum(qxmgivenxors['real'].log_prob(xincluded[:,ids_real].reshape([niws_z*M*batch_size,p_real]))*(1-tiled_mask_x[:,ids_real]),1).reshape([niws_z*M,batch_size])
-            if exists_types[1]:
-                logqxmgivenxor_count = torch.sum(qxmgivenxors['count'].log_prob(xincluded[:,ids_count].reshape([niws_z*M*batch_size,p_count]))*(1-tiled_mask_x[:,ids_count]),1).reshape([niws_z*M,batch_size])
-            if exists_types[2]:
-                logqxmgivenxor_pos = torch.sum(qxmgivenxors['pos'].log_prob(xincluded[:,ids_pos].reshape([niws_z*M*batch_size,p_pos]))*(1-tiled_mask_x[:,ids_pos]),1).reshape([niws_z*M,batch_size])
-
-            # LEVEL 3
-            # Handle categorical features q distributions
-            if exists_types[3]:
-                for ii in range(0,p_cat):
-                    # LEVEL 4
-                    # Calculate indices for categorical data
-                    if ii==0:
-                        C0=0
-                        C1=int(Cs[ii])
-                    else:
-                        C0=C1
-                        C1=C0 + int(Cs[ii])
-                    
-                    # LEVEL 4
-                    # Compute log q probabilities
-                    if ii==0:
-                        logqxmgivenxor_cat = (qxmgivenxors['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([niws_z*M*batch_size,int(Cs[ii])])) * (1-tiled_mask_x[:,(p_real + p_count + p_pos + C0)])).reshape([-1,batch_size])
-                    else:
-                        logqxmgivenxor_cat = logqxmgivenxor_cat + (qxmgivenxors['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([niws_z*M*batch_size,int(Cs[ii])])) * (1-tiled_mask_x[:,(p_real + p_count + p_pos + C0)])).reshape([-1,batch_size])
-
-            # LEVEL 3
-            # Initialize probability sums
-            logpxsum = torch.zeros([niws_z*M,batch_size]).cuda()
-            logqxsum = torch.zeros([niws_z*M,batch_size]).cuda()
-
-        # LEVEL 2
-        # Case 3: Only Y missing
-        elif not miss_x and miss_y:
-            # LEVEL 3
-            # Handle missingness model
-            if not Ignorable:
-                all_logprgivenxy = prgivenxy.log_prob(tiled_mask_y)
-                logprgivenxy = all_logprgivenxy.reshape([niws_z*M,batch_size])
-            else:
-                all_logprgivenxy=torch.Tensor([0]).cuda()
-                logprgivenxy=torch.Tensor([0]).cuda()
-
-            # LEVEL 3
-            # Handle Y distributions and probabilities
-            if family == "Cox":
-                # LEVEL 4
-                # Handle Cox specific missing Y case
-                logqymgivenyor = (qymgivenyor.log_prob(torch.cat([iota_y[:,0].reshape(-1,1), 
-                                iota_y[:,1].reshape(-1,1)], dim=1))*(1-tiled_mask_y)).reshape([niws_z*M,batch_size])
-                
-                times = iota_y[:,0]
-                events = iota_y[:,1]
-                risk_scores = pygivenx.loc
-                
-                baseline_hazard, unique_times = cox_baseline_hazard(risk_scores, times, events)
-                cox_pl_loss = cox_loss(risk_scores, times, events)
-                all_log_pygivenx = -cox_pl_loss
-            else:
-                logqymgivenyor = (qymgivenyor.log_prob(iota_y)*(1-tiled_mask_y)).reshape([niws_z*M,batch_size])
-                logqxsum = 0
-                if family=="Multinomial":
-                    all_log_pygivenx = pygivenx.log_prob(iota_y)
-                else:
-                    all_log_pygivenx = pygivenx.log_prob(iota_y.reshape([-1]))
-
-            logpygivenx = all_log_pygivenx.reshape([niws_z*M,batch_size])
-
-
-            # LEVEL 3
-            # Compute log probabilities for feature types
-            if exists_types[0]:
-                logpx_real = torch.sum(p_xs['real'].log_prob(xincluded[:,ids_real]),axis=1).reshape([niws_z*M,batch_size])
-            if exists_types[1]:
-                logpx_count = torch.sum(p_xs['count'].log_prob(xincluded[:,ids_count]),axis=1).reshape([niws_z*M,batch_size])
-            if exists_types[2]:
-                logpx_pos = torch.sum(p_xs['pos'].log_prob(xincluded[:,ids_pos]),axis=1).reshape([niws_z*M,batch_size])
-            if exists_types[3]:
-                for ii in range(0,p_cat):
-                    # LEVEL 4
-                    # Calculate indices for categorical data
-                    if ii==0:
-                        C0=0; C1=int(Cs[ii])
-                    else:
-                        C0=C1; C1=C0 + int(Cs[ii])
-                    
-                    # LEVEL 4 
-                    # Compute categorical probabilities
-                    if ii==0:
-                        logpx_cat = (p_xs['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([-1,C[ii]]))).reshape([-1,batch_size])
-                    else:
-                        logpx_cat = logpx_cat + (p_xs['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([-1,C[ii]]))).reshape([-1,batch_size])
-
-            # LEVEL 3
-            # Initialize sum terms
-            logpxsum = torch.zeros([M,batch_size]).cuda()
-
-        # LEVEL 2
-        # Case 4: No missing data
         else:
-            # LEVEL 3
-            # Initialize probability terms
-            all_logprgivenxy=torch.Tensor([0]).cuda()
-            logprgivenxy=torch.Tensor([0]).cuda()
-            logqxsum=torch.Tensor([0]).cuda()
-            logqymgivenyor=torch.Tensor([0]).cuda()
+            # LEVEL 3: Handle case where miss_x and not miss_y
+            if miss_x and not miss_y:  # case 1
+                # LEVEL 4: Handle missingness model
+                if not Ignorable:
+                    all_logprgivenxy = prgivenxy.log_prob(tiled_mask_x[:,miss_ids])  # M*bs x p_miss
+                    logprgivenxy = torch.sum(all_logprgivenxy,1).reshape([niws_z*M,batch_size])
+                else:
+                    all_logprgivenxy = torch.Tensor([0]).cuda()
+                    logprgivenxy = torch.Tensor([0]).cuda()
 
-            # LEVEL 3
-            # Handle different model families with no missing data
-            if family == "Cox":
-                # LEVEL 4
-                # Handle Cox model computations
-                times = iota_y[:,0]
-                events = iota_y[:,1]
-                risk_scores = pygivenx.loc
-                
-                # LEVEL 4
-                # Compute Cox model metrics
-                baseline_hazard, unique_times = cox_baseline_hazard(risk_scores, times, events)
-                cox_pl_loss = cox_loss(risk_scores, times, events)
-                all_log_pygivenx = -cox_pl_loss
-            elif family=="Multinomial":
-                all_log_pygivenx = pygivenx.log_prob(iota_y)
-            else:
-                all_log_pygivenx = pygivenx.log_prob(iota_y.reshape([-1]))
+                # LEVEL 4: Log q(xm|xo,r) computations
+                if exists_types[0]:
+                    logqxmgivenxor_real = torch.sum(qxmgivenxors['real'].log_prob(xincluded[:,ids_real].reshape([niws_z*M*batch_size,p_real]))*(1-tiled_mask_x[:,ids_real]),1).reshape([niws_z*M,batch_size])
+                if exists_types[1]:
+                    logqxmgivenxor_count = torch.sum(qxmgivenxors['count'].log_prob(xincluded[:,ids_count].reshape([niws_z*M*batch_size,p_count]))*(1-tiled_mask_x[:,ids_count]),1).reshape([niws_z*M,batch_size])
+                if exists_types[2]:
+                    logqxmgivenxor_pos = torch.sum(qxmgivenxors['pos'].log_prob(xincluded[:,ids_pos].reshape([niws_z*M*batch_size,p_pos]))*(1-tiled_mask_x[:,ids_pos]),1).reshape([niws_z*M,batch_size])
+                if exists_types[3]:
+                    for ii in range(0,p_cat):
+                        if ii==0:
+                            C0=0
+                            C1=int(Cs[ii])
+                        else:
+                            C0=C1
+                            C1=C0 + int(Cs[ii])
+                        if ii==0:
+                            logqxmgivenxor_cat = (qxmgivenxors['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([niws_z*M*batch_size,int(Cs[ii])])) * (1-tiled_mask_x[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)])).reshape([-1,batch_size])
+                        else:
+                            logqxmgivenxor_cat = logqxmgivenxor_cat + (qxmgivenxors['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([niws_z*M*batch_size,int(Cs[ii])])) * (1-tiled_mask_x[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)])).reshape([-1,batch_size])
 
-            # LEVEL 3
-            # Reshape log probability
-            logpygivenx = all_log_pygivenx.reshape([niws_z*1*batch_size])
+                # LEVEL 4: Log p(y|x) computation
+                if family=="Multinomial":
+                    all_log_pygivenx = pygivenx.log_prob(yincluded)
+                else:
+                    all_log_pygivenx = pygivenx.log_prob(yincluded.reshape([-1]))
 
-            # LEVEL 3
-            # Compute feature probabilities for complete data
-            if exists_types[0]:
-                logpx_real = torch.sum(p_xs['real'].log_prob(xincluded[:,ids_real]),axis=1).reshape([niws_z*1*batch_size])
-            if exists_types[1]:
-                logpx_count = torch.sum(p_xs['count'].log_prob(xincluded[:,ids_count]),axis=1).reshape([niws_z*1*batch_size])
-            if exists_types[2]:
-                logpx_pos = torch.sum(p_xs['pos'].log_prob(xincluded[:,ids_pos]),axis=1).reshape([niws_z*1*batch_size])
+                logpygivenx = all_log_pygivenx.reshape([niws_z*M,batch_size])
 
-            # LEVEL 3
-            # Handle categorical features
-            if exists_types[3]:
-                for ii in range(0,p_cat):
-                    # LEVEL 4
-                    # Calculate indices
-                    if ii==0:
-                        C0=0
-                        C1=int(Cs[ii])
-                    else:
-                        C0=C1
-                        C1=C0 + int(Cs[ii])
+                # LEVEL 4: Log p(x) VAE computations
+                if exists_types[0]:
+                    logpx_real = torch.sum(p_xs['real'].log_prob(xincluded[:,ids_real]),axis=1).reshape([niws_z*M,batch_size])
+                if exists_types[1]:
+                    logpx_count = torch.sum(p_xs['count'].log_prob(xincluded[:,ids_count]),axis=1).reshape([niws_z*M,batch_size])
+                if exists_types[2]:
+                    logpx_pos = torch.sum(p_xs['pos'].log_prob(xincluded[:,ids_pos]),axis=1).reshape([niws_z*M,batch_size])
+                if exists_types[3]:
+                    for ii in range(0,p_cat):
+                        if ii==0:
+                            C0=0
+                            C1=int(Cs[ii])
+                        else:
+                            C0=C1
+                            C1=C0 + int(Cs[ii])
+                        if ii==0:
+                            logpx_cat = p_xs['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)]).reshape([niws_z*M,batch_size])
+                        else:
+                            logpx_cat = logpx_cat + p_xs['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)]).reshape([niws_z*M,batch_size])
 
+                logpxsum = torch.zeros([niws_z*M,batch_size]).cuda()
+                logqxsum = torch.zeros([niws_z*M,batch_size]).cuda()
 
-                    # LEVEL 4
-                    # Compute categorical probabilities
-                    if ii==0:
-                        logpx_cat = (p_xs['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([-1,C]))).reshape([-1])
-                    else:
-                        logpx_cat = logpx_cat + (p_xs['cat'][ii].log_prob(xincluded[:,(p_real + p_count + p_pos + C0):(p_real + p_count + p_pos + C1)].reshape([-1,C]))).reshape([-1])
+            # LEVEL 3: Handle case where not miss_x and miss_y
+            elif not miss_x and miss_y:    # case 2
+                # LEVEL 4: Handle missingness model
+                if not Ignorable:
+                    all_logprgivenxy = prgivenxy.log_prob(tiled_mask_y)  # M*bs x 1
+                    logprgivenxy = torch.sum(all_logprgivenxy,1).reshape([niws_z*M,batch_size])
+                else:
+                    all_logprgivenxy = torch.Tensor([0]).cuda()
+                    logprgivenxy = torch.Tensor([0]).cuda()
 
-            # LEVEL 3
-            # Initialize final sums
-            logpxsum = torch.zeros([niws_z*1,batch_size]).cuda()
-            logqxsum = torch.zeros([niws_z*1*batch_size]).cuda()
+                # LEVEL 4: Log p(y|x) computation
+                if family == "Cox":
+                    times = iota_y[:,0]
+                    events = iota_y[:,1]
+                    risk_scores = pygivenx.loc
+                    
+                    baseline_hazard, unique_times = cox_baseline_hazard(risk_scores, times, events)
+                    cox_pl_loss = cox_loss(risk_scores, times, events)
+                    all_log_pygivenx = -cox_pl_loss
+                elif family=="Multinomial":
+                    all_log_pygivenx = pygivenx.log_prob(yincluded)
+                else:
+                    all_log_pygivenx = pygivenx.log_prob(yincluded.reshape([-1]))
 
-        # LEVEL 2
-        # Compute importance weights
+                logpygivenx = all_log_pygivenx.reshape([niws_z*M,batch_size])
+
+                # LEVEL 4: Log q(ym|yo,r,xm,xo)
+                logqymgivenyor = (qymgivenyor.log_prob(yincluded)*(1-tiled_mask_y)).reshape([niws_z*M,batch_size])
+
+                # LEVEL 4: Initialize probability sums
+                logpxsum = torch.zeros([niws_z*M,batch_size]).cuda()
+                logqxsum = torch.zeros([niws_z*M,batch_size]).cuda()
+
+            # LEVEL 3: Handle case where neither x nor y is missing
+            else:   # case 0
+                # LEVEL 4: Handle missingness model
+                if not Ignorable:
+                    logprgivenxy = torch.zeros([1,batch_size]).cuda()
+                else:
+                    logprgivenxy = torch.zeros([1,batch_size]).cuda()
+
+                # LEVEL 4: Log p(y|x) computation
+                if family == "Cox":
+                    times = iota_y[:,0]
+                    events = iota_y[:,1]
+                    risk_scores = pygivenx.loc
+                    
+                    baseline_hazard, unique_times = cox_baseline_hazard(risk_scores, times, events)
+                    cox_pl_loss = cox_loss(risk_scores, times, events)
+                    all_log_pygivenx = -cox_pl_loss
+                elif family=="Multinomial":
+                    all_log_pygivenx = pygivenx.log_prob(yincluded)
+                else:
+                    all_log_pygivenx = pygivenx.log_prob(yincluded.reshape([-1]))
+
+                logpygivenx = all_log_pygivenx.reshape([1,batch_size])
+
+                # LEVEL 4: Initialize probability sums
+                logpxsum = torch.zeros([1,batch_size]).cuda()
+                logqxsum = torch.zeros([1,batch_size]).cuda()
+
+        # LEVEL 2: Compute total sums and importance weights
+        if exists_types[0]:
+            logpxsum = logpxsum + logpx_real
+            logqxsum = logqxsum + logqxmgivenxor_real
+        if exists_types[1]:
+            logpxsum = logpxsum + logpx_count
+            logqxsum = logqxsum + logqxmgivenxor_count
+        if exists_types[2]:
+            logpxsum = logpxsum + logpx_pos
+            logqxsum = logqxsum + logqxmgivenxor_pos
+        if exists_types[3]:
+            logpxsum = logpxsum + logpx_cat
+            logqxsum = logqxsum + logqxmgivenxor_cat
+
+        # LEVEL 2: Compute importance weights with VAE terms
+        logpz = p_z.log_prob(zgivenx).reshape([-1,batch_size])
+        logqzgivenx = torch.sum(qzgivenx.log_prob(zgivenx.reshape([-1,batch_size,dim_z])),axis=2).reshape([-1,batch_size])
+
         IW = logpxsum + logpygivenx
-        
         if not Ignorable:
             IW = IW + logprgivenxy
 
-        # LEVEL 2
-        # Handle different missing data cases for weights computation
+        # LEVEL 2: Calculate final importance weights based on missing data pattern
         if miss_x and miss_y:
             imp_weights = torch.nn.functional.softmax(IW + torch.Tensor.repeat(logpz,[M*M,1]) - torch.Tensor.repeat(logqzgivenx,[M*M,1]) - logqxsum - logqymgivenyor, 0)
         elif miss_x and not miss_y:
@@ -1728,27 +1601,30 @@ def dlglm(X,Rx,Y,Ry, covars_r_x, covars_r_y, norm_means_x, norm_sds_x, norm_mean
         else:
             imp_weights = torch.ones([1,batch_size])
 
-        # LEVEL 2
-        # Compute final imputations
+        # LEVEL 2: Compute final imputations using importance weights
         xm = torch.einsum('ki,kij->ij', imp_weights.float(), xincluded.reshape([-1,batch_size,p]).float())
         xms = xincluded.reshape([-1,batch_size,p])
 
-        # LEVEL 2
-        # Handle Y imputations
+        # LEVEL 2: Handle Y imputations with Cox-specific components
         if miss_y:
             if family == "Cox":
-                # Handle both time and event components
-                ym_time = torch.einsum('ki,kij->ij', imp_weights.float(), iota_y[:,0].reshape([-1,batch_size,1]).float())
-                ym_event = torch.einsum('ki,kij->ij', imp_weights.float(), iota_y[:,1].reshape([-1,batch_size,1]).float())
+                # Handle both time and event components for Cox model
+                ym_time = torch.einsum('ki,kij->ij', imp_weights.float(), yincluded[:,0].reshape([-1,batch_size,1]).float())
+                ym_event = torch.einsum('ki,kij->ij', imp_weights.float(), yincluded[:,1].reshape([-1,batch_size,1]).float())
                 ym = torch.cat([ym_time, ym_event], dim=1)
-                yms = iota_y.reshape([-1,batch_size,2])
+                yms = yincluded.reshape([-1,batch_size,2])
             else:
-                ym = torch.einsum('ki,kij->ij', imp_weights.float(), iota_y.reshape([-1,batch_size,1]).float())
-                yms = iota_y.reshape([-1,batch_size,1])
+                ym = torch.einsum('ki,kij->ij', imp_weights.float(), yincluded.reshape([-1,batch_size,1]).float())
+                yms = yincluded.reshape([-1,batch_size,1])
         else:
             ym = iota_y
             yms = iota_y
 
-        # LEVEL 2
-        # Return results
-        return {'xm': xm, 'ym': ym, 'imp_weights':imp_weights, 'xms': xms.detach(), 'yms': yms.detach()}
+        # LEVEL 2: Return results
+        return {
+            'xm': xm,
+            'ym': ym,
+            'imp_weights': imp_weights,
+            'xms': xms.detach(),
+            'yms': yms.detach()
+        }
